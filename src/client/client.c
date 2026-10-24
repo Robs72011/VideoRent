@@ -1,0 +1,670 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <fcntl.h>
+#include "client.h"
+#include "client_protocol.h"
+#include "client_logic.h"
+
+
+// ============================================================================
+// GLOBAL VARIABLES
+// ============================================================================
+
+pthread_t tid;
+threads_sync_t* threads_sync;
+
+unsigned int user_id;
+int client_socket;
+cart_t cart;
+
+int film_reminder = 0;
+
+int num_films_available;
+film_t available_films[MAX_FILMS];
+
+int num_expired_films;
+film_t expired_films[MAX_FILMS];
+
+int num_rented_films;
+film_t rented_films[MAX_FILMS];
+
+int num_reservations;
+reservation_t reservations[MAX_RESERVATIONS];
+
+int cart_cap = 5;
+char current_username[MAX_USER_USERNAME_SIZE] = "Ospite";
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
+int main(){
+
+	const char *server_host = getenv("SERVER_HOST");
+
+	if (server_host == NULL) {
+        printf("[CLIENT] Variabile d'ambiente SERVER_HOST non definita, impostando host %s di default.\n", DEFAULT_SERVER_HOST);
+        server_host = DEFAULT_SERVER_HOST;
+    }
+
+	const char *server_port = getenv("SERVER_PORT");
+	
+	if (server_port == NULL) {
+        printf("[CLIENT] Variabile d'ambiente SERVER_PORT non definita, impostando porta %s di default\n", DEFAULT_SERVER_PORT);
+		server_port = DEFAULT_SERVER_PORT;
+	}
+
+	struct sockaddr_in server_address;
+	socklen_t server_address_len = sizeof(server_address);
+
+	memset(&server_address, 0, server_address_len);
+
+	server_address.sin_family = AF_INET;
+	server_address.sin_port = htons(atoi(server_port));
+
+	struct hostent *server_host_info = gethostbyname(server_host);
+
+	if ((server_host_info = gethostbyname(server_host)) == NULL) {
+        printf("[CLIENT] Impossibile risolvere l'hostname: %s\n", server_host);
+        exit(-1);
+    }
+
+	// Copia l'indirizzo binario ottenuto direttamente nella struttura della socket
+	memcpy(&server_address.sin_addr, server_host_info->h_addr_list[0], server_host_info->h_length);
+
+	if((client_socket = socket(PF_INET, SOCK_STREAM, 0)) < 0){
+		perror("[CLIENT] Impossibile aprire la socket!\n");
+		exit(-1);
+	}
+
+	if(connect(client_socket, (struct sockaddr *) &server_address, server_address_len) < 0){
+		perror("[CLIENT] Impossibile connettersi al server.\n");
+		exit(-1);
+	}
+
+	printf("[CLIENT] Client connesso con successo al server!\n");
+
+	threads_sync = init_threads_sync();
+
+	pid_t client_pid = getpid();
+	if(write(client_socket, &client_pid, sizeof(client_pid)) < 0){
+		printf("[CLIENT] Impossibile inviare pid %d del processo al server.\n", client_pid);
+		exit(-1);
+	}
+
+	printf("[CLIENT] Inviato pid %d al server.\n", client_pid);
+
+	if(pthread_create(&tid, NULL, listener_thread, NULL) < 0){
+		printf("[CLIENT] Impossibile creare thread per ricezione notifiche.\n");
+		exit(-1);
+	}
+
+	while(1){	
+		clear_screen();
+		switch(start_up_menu()){
+			case 1:
+				register_user(client_socket);
+				break;
+			case 2:
+				login_user(client_socket);
+				break;
+			case 0:
+				printf("Arrivederci\n");
+				exit(0);
+				break;
+			default:
+				printf("Scelta non valida, ritentare.\n");
+				sleep(2);
+		}
+	}
+
+	free(threads_sync);
+	return 0;
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+void clear_screen(){
+#ifdef _WIN32
+	system("cls");
+#else
+	system("clear");
+#endif
+}
+
+void show_main_view(void){
+	clear_screen();
+	print_films();
+	printf("\n=== CARRELLO ATTUALE ===\n");
+	print_cart();
+}
+
+void consume_stdin_line(void){
+	int c;
+	while((c = getchar()) != '\n' && c != EOF){ }
+}
+
+int read_menu_choice(const char *prompt){
+	int choice = -1;
+	printf("%s", prompt);
+	int result = scanf("%d", &choice);
+	if(result != 1){
+		consume_stdin_line();
+		return -1;
+	}
+	consume_stdin_line();
+	return choice;
+}
+
+void print_films(void){
+	printf("%-3s %-30s %15s %15s\n",
+			"ID", "Title", "Available", "Rented");
+	printf("-----------------------------------------------------------------------\n");
+	for(int i = 0; i < num_films_available; i++){
+		printf("%-3d %-30s %15d %15d\n",
+				available_films[i].id,
+				available_films[i].title,
+				available_films[i].available_copies,
+				available_films[i].rented_out_copies);
+	}
+}
+
+void print_rented_films(void){
+	printf("\n=== FILM NOLEGGIATI ===\n");
+	printf("%-3s %-30s\n",
+			"ID", "Title");
+	printf("-----------------------------------------------------------------------\n");
+	for(int i = 0; i < num_rented_films; i++){
+		printf("%-3d %-30s\n",
+				rented_films[i].id,
+				rented_films[i].title);
+	}
+}
+
+void print_cart(void){
+	if(cart.dim == 0){
+		printf("Il carrello e' vuoto.\n");
+		return;
+	}
+	printf("%-3s %-30s %10s\n", "ID", "Title", "Qta");
+	printf("-----------------------------------------------------------------------\n");
+	int printed_ids[MAX_FILMS] = {0};
+	int printed_count = 0;
+	for(int i = 0; i < cart.dim; i++){
+		int movie_id = cart.film_id_to_rent[i];
+		int already_printed = 0;
+		for(int j = 0; j < printed_count; j++){
+			if(printed_ids[j] == movie_id){
+				already_printed = 1;
+				break;
+			}
+		}
+		if(already_printed)
+			continue;
+
+		int idx = get_movie_idx_by_id(movie_id);
+		int qty = get_cart_count_by_id(movie_id);
+		if(idx >= 0){
+			printf("%-3d %-30s %10d\n", available_films[idx].id, available_films[idx].title, qty);
+		} else {
+			printf("%-3d %-30s %10d\n", movie_id, "(sconosciuto)", qty);
+		}
+		printed_ids[printed_count++] = movie_id;
+	}
+	printf("Numero film nel carrello: %d/%d\n", cart.dim, cart_cap);
+}
+
+void print_expired_films(){
+	printf("-----------------------------------------------------------------------\n");
+	printf("Restituire i seguenti film, in quanto e' terminato il periodo di noleggio.\n");
+	printf("-----------------------------------------------------------------------\n");
+	printf("%-3s %-30s\n",
+			"ID", "Title");
+	printf("-----------------------------------------------------------------------\n");
+	for(int i = 0; i < num_expired_films; i++){
+		printf("%-3d %-30s\n",
+		expired_films[i].id,
+		expired_films[i].title);
+	}
+}
+
+void print_reservations(void){
+	printf("\n=== PRENOTAZIONI ===\n");
+	if(num_reservations == 0){
+		printf("Nessuna prenotazione presente.\n");
+		return;
+	}
+	printf("%-5s %-10s %-10s %-20s %-20s %-20s\n",
+			"ID", "User ID", "Film ID", "Data Noleggio", "Data Scadenza", "Data Riconsegna");
+	printf("----------------------------------------------------------------------------------------------------\n");
+	
+	char rental_date_str[20];
+	char expiring_date_str[20];
+	char due_date_str[20];
+	
+	for(int i = 0; i < num_reservations; i++){
+		convert_date_to_string(reservations[i].rental_date, rental_date_str, sizeof(rental_date_str));
+		convert_date_to_string(reservations[i].expiring_date, expiring_date_str, sizeof(expiring_date_str));
+		convert_date_to_string(reservations[i].due_date, due_date_str, sizeof(due_date_str));
+		
+		printf("%-5u %-10u %-10u %-20s %-20s %-20s\n",
+				reservations[i].id,
+				reservations[i].user_id,
+				reservations[i].film_id,
+				rental_date_str,
+				expiring_date_str,
+				due_date_str);
+	}
+	printf("\nTotale prenotazioni: %d\n", num_reservations);
+}
+
+// ============================================================================
+// MENU UI
+// ============================================================================
+
+int start_up_menu(void){
+	printf("=== BENVENUTO IN VIDEO NOLEGGIO ===\n");
+	printf("1 - Register\n2 - Login\n0 - Exit\n");
+	return read_menu_choice("Inserire un numero per proseguire: ");
+}
+
+int renting_menu(){
+	printf("\n=== MENU NOLEGGIO ===\n");
+	printf("Utente: %s\n", current_username);
+	printf("Max film noleggiabili (venditore): %d\n", cart_cap);
+	printf("1 - Inserisci ID film da noleggiare (separati da virgola, max %d)\n", cart_cap);
+	printf("2 - Modifica carrello\n");
+	printf("3 - Procedere al checkout\n");
+	printf("4 - Stampa film noleggiati\n");
+	printf("5 - Restituzione film noleggiato\n");
+	printf("6 - Logout\n");
+	return read_menu_choice("Inserire un numero per proseguire: ");
+}
+
+int shopkeeper_menu_display(){
+	print_films();
+	printf("\n=== MENU NEGOZIANTE ===\n");
+	printf("Utente: %s\n", current_username);
+	printf("Max film noleggiabili (venditore): %d\n", cart_cap);
+	printf("1 - Invia notifica per film non restituiti\n");
+	printf("2 - Imposta limite film noleggiabili\n");
+	printf("3 - Visualizza tutte le prenotazioni\n");
+	printf("0 - Esci\n");
+	return read_menu_choice("Inserire un numero per proseguire: ");
+}
+
+void rental_menu(int client_socket){
+	int choice;
+
+	show_main_view();
+	
+	while(1){
+		// Aggiorna sempre la lista dei film noleggiati all'inizio del loop
+		get_all_films(client_socket);
+		get_user_rented_films(client_socket);
+
+		// rimuovere la parte dopo && num_rented_films > 0 se in testing non va
+		if(film_reminder){
+			clear_screen();
+			printf("\n[NOTIFICA] Il negoziante ha notificato che il noleggio di alcuni film in tuo possesso è scaduto! Verranno mostrati a schermo.\n\n");
+			get_all_user_expired_films_with_no_due_date(client_socket);
+			print_expired_films();
+
+			printf("\nPremere INVIO per tornare al menu...");
+			getchar();
+
+			film_reminder = 0;
+		}
+
+		show_main_view();
+
+		choice = renting_menu();
+
+		switch(choice){
+			case 1:
+				handle_add_films();
+				break;
+			case 2:
+				handle_modify_cart();
+				break;
+			case 3:
+				handle_checkout(client_socket);
+				break;
+			case 4:
+				handle_show_rented(client_socket);
+				break;
+			case 5:
+				handle_return(client_socket);
+				break;
+			case 6:
+				if(handle_logout()){
+					return;
+				}
+				break;
+			default:
+				printf("Scelta non valida.\n");
+				sleep(2);
+		}
+		get_max_rented_films(client_socket);
+	}
+}
+
+
+// ============================================================================
+// AUTHENTICATION & USER FLOW
+// ============================================================================
+
+void register_user(int client_socket){
+	clear_screen();
+
+	char username[MAX_USER_USERNAME_SIZE] = {0};
+	printf("Inserire il username che si desidera usare: ");
+	scanf("%s", username);
+
+	char password[MAX_USER_PASSWORD_SIZE] = {0};
+	printf("Inserire la password che si desidera usare: ");
+	scanf("%s", password);
+
+	register_user_request(client_socket, username, password);
+	sleep(2);
+	return;
+}
+
+void login_user(int client_socket){
+	clear_screen();
+
+	char username[MAX_USER_USERNAME_SIZE] = {0};
+	printf("Inserisci username: ");
+	scanf("%s", username);
+
+	char password[MAX_USER_PASSWORD_SIZE] = {0};
+	printf("Inserisci password: ");
+	scanf("%s", password);
+
+	if(login_user_request(client_socket, username, password) < 0){
+		sleep(2);
+		return;
+	}
+	
+	strncpy(current_username, username, sizeof(current_username) - 1);
+	current_username[sizeof(current_username) - 1] = '\0';
+
+	get_all_films(client_socket);
+	get_max_rented_films(client_socket);
+	
+	if(strncmp(username, "negoziante", 10) == 0){
+		shopkeeper_menu(client_socket);
+	}else{
+		init_cart();
+		rental_menu(client_socket);
+	}
+}
+
+// ============================================================================
+// RENTAL HANDLERS
+// ============================================================================
+
+void handle_add_films(void){
+	clear_screen();
+	if(cart.dim >= cart_cap){
+		printf("Carrello pieno! Non è possibile aggiungere altri film.\n");
+		sleep(2);
+		return;
+	}
+	show_main_view();
+
+	printf("\nInserire gli ID dei film da noleggiare (separati da virgola):\n");
+	printf("Esempio: 1,3,5 oppure 2, 4, 7\n");
+	printf("ID film: ");
+
+	char film_input[100] = {0};
+	scanf(" %99[^\n]", film_input);
+	consume_stdin_line();
+
+	if(film_input[0] == '\0'){
+		printf("Nessun ID inserito.\n");
+		sleep(1);
+		return;
+	}
+
+	int film_ids[cart_cap];
+	int count = 0;
+	parse_film_ids(film_input, film_ids, &count);
+
+	if(count > 0){
+		for(int i = 0; i < count; i++){
+			int idx = get_movie_idx_by_id(film_ids[i]);
+			add_to_cart(film_ids[i]);
+			printf("Film '%s' aggiunto al carrello.\n", available_films[idx].title);
+		}
+	}
+	sleep(3);
+	show_main_view();
+}
+
+void handle_modify_cart(void){
+	if(cart.dim == 0){
+		printf("Il carrello è vuoto.\n");
+		sleep(2);
+		show_main_view();
+		return;
+	}
+	while(1){
+		clear_screen();
+		printf("=== MODIFICA CARRELLO ===\n");
+		print_cart();
+		printf("\n1 - Rimuovi film dal carrello\n");
+		printf("2 - Svuota carrello\n");
+		printf("0 - Torna al menu noleggio\n");
+		int sub_choice = read_menu_choice("Scelta: ");
+		if(sub_choice == 1){
+			if(cart.dim > 0){
+				printf("Inserire gli ID separati da virgola (es: 1,3,5)\n");
+				char remove_input[100] = {0};
+				scanf(" %99[^\n]", remove_input);
+				consume_stdin_line();
+				remove_from_cart(remove_input);
+				clear_screen();
+				printf("=== CARRELLO AGGIORNATO ===\n");
+				print_cart();
+			} else {
+				printf("Il carrello è vuoto.\n");
+			}
+			printf("Premere INVIO per continuare...\n");
+			getchar();
+		} else if(sub_choice == 2){
+			cart.dim = 0;
+			clear_screen();
+			printf("Carrello svuotato.\n");
+			sleep(1);
+			break;
+		} else if(sub_choice == 0){
+			break;
+		} else {
+			printf("Scelta non valida.\n");
+			sleep(1);
+		}
+	}
+	show_main_view();
+}
+
+void handle_checkout(int client_socket){
+	if(cart.dim == 0){
+		printf("Il carrello è vuoto! Non è possibile procedere al checkout.\n");
+		sleep(2);
+		return;
+	}
+
+	clear_screen();
+	printf("=== CHECKOUT ===\n");
+	print_cart();
+	printf("\n");
+
+	char choice; 
+	printf("Procedere al checkout (s/n)? ");
+	scanf(" %c", &choice);
+	getchar();
+
+	if(choice == 'n' || choice == 'N')
+		return;
+	else if((choice == 's' || choice == 'S') && cart.dim > 0){
+		for(int i = 0; i < cart.dim; i++){
+			printf("Noleggiando film con ID %d...\n", cart.film_id_to_rent[i]);
+			rent_film(client_socket, i);
+		}
+		empty_out_cart();
+	}else{
+		printf("Opzione non valida!\n");
+		return;
+	}
+
+	printf("\nPremere INVIO per tornare al menu principale...\n");
+	getchar();
+	show_main_view();
+}
+
+void handle_show_rented(int client_socket){
+	clear_screen();
+	get_user_rented_films(client_socket);
+	print_rented_films();
+	printf("\nPremere INVIO per tornare al menu...\n");
+	getchar();
+}
+
+void handle_return(int client_socket){
+	clear_screen();
+	print_rented_films();
+
+	printf("\nInserisci gli ID dei film da restituire (separati da virgola):\n");
+	printf("Esempio: 1,3,5\n");
+	printf("ID film: ");
+	
+	char film_input[100] = {0};
+	scanf(" %99[^\n]", film_input);
+	consume_stdin_line();
+	
+	if(film_input[0] == '\0'){
+		printf("Nessun ID inserito.\n");
+		sleep(2);
+		return;
+	}
+	
+	int film_ids[MAX_FILMS];
+	int count = 0;
+	parse_film_ids_to_return(film_input, film_ids, &count);
+	
+	if(count == 0){
+		printf("Nessun ID valido inserito.\n");
+		sleep(2);
+		return;
+	}
+	
+	printf("\n");
+	for(int i = 0; i < count; i++){
+		// Trova il titolo del film
+		char *film_title = "Film sconosciuto";
+		for(int j = 0; j < num_rented_films; j++){
+			if(rented_films[j].id == film_ids[i]){
+				film_title = rented_films[j].title;
+				break;
+			}
+		}
+		printf("Restituendo '%s' (ID: %d)...\n", film_title, film_ids[i]);
+		if(return_film(client_socket, film_ids[i]) == 0){
+			remove_returned_film_from_memory(film_ids[i]);
+		}
+	}
+
+	printf("\n✓ Operazione completata!\n");
+	printf("\nPremere INVIO per tornare al menu principale...\n");
+	getchar();
+	show_main_view();
+}
+
+int handle_logout(void){
+	clear_screen();
+	printf("=== CARRELLO ===\n");
+	print_cart();
+	printf("\nConfermare il logout? (s/n): ");
+	char confirm;
+	scanf(" %c", &confirm);
+	consume_stdin_line();
+	if(confirm == 's' || confirm == 'S'){
+		printf("Logout in corso...\n");
+		cart.dim = 0;
+		return 1;
+	}
+	show_main_view();
+	return 0;
+}
+
+// ============================================================================
+// SHOPKEEPER MENU
+// ============================================================================
+
+void shopkeeper_menu(int client_socket){
+	int choice;
+
+	while(1){
+		get_all_films(client_socket);
+		clear_screen();
+		
+		choice = shopkeeper_menu_display();
+
+		switch(choice){
+			case 1:
+				shopkeeper_notify_expired_films(client_socket);
+				sleep(2);
+				break;
+			case 2:
+				set_cap_films(client_socket);
+				break;
+			case 3:
+				handle_show_reservations(client_socket);
+				break;
+			case 0:
+				printf("Arrivederci!\n");
+				exit(0);
+			default:
+				printf("Scelta non valida.\n");
+				sleep(2);
+		}
+	}
+}
+
+void set_cap_films(int client_socket){
+	int new_film_cap; 
+
+	printf("A quanto si vuole impostare il nuovo limite di film da affittare: ");
+	scanf("%d", &new_film_cap);
+	consume_stdin_line();
+
+	if(shopkeeper_change_max_rented_films(client_socket, new_film_cap) < 0){
+		return;
+	}
+
+	if(new_film_cap > 0)
+		cart_cap = new_film_cap;
+}
+
+void handle_show_reservations(int client_socket){
+	clear_screen();
+	printf("Caricamento prenotazioni...\n");
+	get_all_reservations(client_socket);
+	printf("Prenotazioni caricate: %d\n\n", num_reservations);
+	print_reservations();
+	printf("\nPremere INVIO per tornare al menu...\n");
+	getchar();
+}
+
